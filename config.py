@@ -1,0 +1,10 @@
+MASTER_PORT = 5010
+BUFFER_SIZE = 1024
+
+THRESHOLD = 4
+
+TASK_PROCESS_TIME = 6
+
+REQUEST_INTERVAL = 4
+
+LOG_SEPARATOR = "======================================="
