@@ -1,263 +1,224 @@
-"""
-worker.py
-=========
-Worker com suporte a eleição de master.
-
-Fluxo normal:
-  1. Conecta ao master e se registra.
-  2. Envia heartbeat a cada HEARTBEAT_INTERVAL segundos.
-  3. Ouve tarefas enviadas pelo master e as processa.
-
-Fluxo de falha:
-  4. Se o heartbeat falhar HEARTBEAT_FAIL_THRESHOLD vezes seguidas,
-     inicia a eleição via election.py.
-  5a. Se eleito master → sobe o servidor master (master.py) neste processo.
-  5b. Se não eleito    → reconecta ao novo master e retoma o fluxo normal.
-"""
-
 import socket
 import time
 import uuid
 import threading
-import sys
-import os
+import shutil
 
 from protocol import *
 from network import *
 from config import *
-from election import start_election
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Configuração inicial
-# ─────────────────────────────────────────────────────────────────────────────
+import master  # Importamos para o worker poder virar master
 
 worker_id = str(uuid.uuid4())
 
-# IP deste worker (visível pelos peers). Ajuste conforme sua rede.
-MY_IP = os.environ.get("WORKER_IP", "127.0.0.1")
+# --- CONFIGURAÇÃO DE IP NA REDE ---
+my_ip = "10.62.206.210"            # IP deste Worker (PC do seu amigo)
+current_master_ip = "10.62.206.21" # IP do Master inicial (Seu PC)
+current_master_port = MASTER_PORT
+sock = None
 
-# IP e porta do master atual (pode ser sobrescrito após eleição)
-master_ip   = os.environ.get("MASTER_IP", "10.62.206.53")
-master_port = int(os.environ.get("MASTER_PORT", str(MASTER_PORT)))
+# --- VARIÁVEIS DE ESTADO ---
+hosting_master = False  # Flag correta para manter o programa vivo
+in_election = False
+heartbeat_fails = 0
+election_bids = {}
 
-# IPs dos outros workers conhecidos (para broadcast da eleição).
-# Preencha com os IPs reais ou passe via variável de ambiente separada por vírgula.
-_peer_env   = os.environ.get("PEER_IPS", "")
-PEER_IPS    = [ip.strip() for ip in _peer_env.split(",") if ip.strip()]
 
-# Estado compartilhado entre threads
-heartbeat_fail_count = 0
-election_in_progress = False
-current_sock         = None
-lock                 = threading.Lock()
+def get_free_disk_space():
+    return shutil.disk_usage("/").free
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Processamento de tarefa
-# ─────────────────────────────────────────────────────────────────────────────
 
 def process_task():
     print(LOG_SEPARATOR)
-    print("[WORKER]", worker_id)
-    print("Executando tarefa...")
-    print("Simulando processamento...")
+    print(f"[WORKER] {worker_id} - Executando tarefa...")
     time.sleep(TASK_PROCESS_TIME)
     print("Tarefa concluída")
     print(LOG_SEPARATOR)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Conexão ao master
-# ─────────────────────────────────────────────────────────────────────────────
 
 def connect_to_master(ip, port):
+    global sock
     print(LOG_SEPARATOR)
     print(f"[WORKER] Conectando ao master {ip}:{port}")
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((ip, port))
-    send_message(sock, register_worker(worker_id))
-    print("[WORKER] Registrado no master")
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((ip, port))
+        send_message(sock, register_worker(worker_id))
+        print("[WORKER] Registrado no master")
+        return True
+    except Exception as e:
+        print(f"[WORKER] Falha ao conectar no Master: {e}")
+        return False
+
+
+def start_election():
+    global in_election, election_bids, hosting_master, current_master_ip, heartbeat_fails
+    
+    in_election = True
+    election_bids.clear()
+    
+    my_space = get_free_disk_space()
     print(LOG_SEPARATOR)
-    return sock
+    print(f"👑 [ELEIÇÃO] Iniciada! Meu espaço em disco: {my_space / (1024**3):.2f} GB")
+    
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    
+    bid_msg = encode_message(election_bid(worker_id, my_space, my_ip, MASTER_PORT))
+    
+    for _ in range(3):
+        udp_sock.sendto(bid_msg, ("<broadcast>", ELECTION_PORT))
+        time.sleep(0.5)
+        
+    print(f"[ELEIÇÃO] Aguardando respostas por {ELECTION_TIMEOUT}s...")
+    time.sleep(ELECTION_TIMEOUT)
+    
+    winner_id = worker_id
+    max_space = my_space
+    winner_ip = my_ip
+    
+    for pid, info in election_bids.items():
+        if info["space"] > max_space:
+            max_space = info["space"]
+            winner_id = pid
+            winner_ip = info["ip"]
+        elif info["space"] == max_space and pid > winner_id:
+            winner_id = pid
+            winner_ip = info["ip"]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Heartbeat com detecção de falha
-# ─────────────────────────────────────────────────────────────────────────────
+    if winner_id == worker_id:
+        print(LOG_SEPARATOR)
+        print("👑 [ELEIÇÃO] EU VENCI! ME TORNANDO O NOVO MASTER!")
+        print(LOG_SEPARATOR)
+        hosting_master = True
+        
+        # --- CORREÇÃO DO ERRO AQUI ---
+        # A linha 'x = ...' foi removida. Usamos apenas a mensagem codificada correta.
+        vic_msg = encode_message(election_victory(worker_id, my_ip, MASTER_PORT))
+        udp_sock.sendto(vic_msg, ("<broadcast>", ELECTION_PORT))
+        
+        # Inicia os serviços do Master
+        master.start_master_services(MASTER_PORT)
+        
+        # O novo master se conecta a si mesmo para virar worker
+        time.sleep(1.5)
+        print("[WORKER] Conectando a mim mesmo para continuar trabalhando...")
+        current_master_ip = my_ip
+        if connect_to_master(current_master_ip, MASTER_PORT):
+            heartbeat_fails = 0
+            
+    else:
+        print(LOG_SEPARATOR)
+        print(f"[ELEIÇÃO] Vencedor foi {winner_id}. Conectando ao novo master...")
+        print(LOG_SEPARATOR)
+    
+    in_election = False
+    udp_sock.close()
 
-def send_heartbeat(sock):
-    """
-    Envia heartbeat periodicamente.
-    Conta falhas consecutivas e dispara eleição quando atinge o threshold.
-    """
-    global heartbeat_fail_count, election_in_progress, current_sock
 
+def listen_election_messages():
+    global current_master_ip, heartbeat_fails
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    if hasattr(socket, 'SO_REUSEPORT'):
+        udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        
+    udp_sock.bind(("", ELECTION_PORT))
+    
     while True:
-        time.sleep(HEARTBEAT_INTERVAL)
-
-        with lock:
-            if election_in_progress:
-                # Aguarda eleição terminar antes de continuar
-                continue
-
-        print("[WORKER] Enviando HEARTBEAT")
-
+        data, addr = udp_sock.recvfrom(2048)
+        if hosting_master: 
+            continue
+            
         try:
-            send_message(sock, heartbeat(worker_id))
+            msg = decode_message(data.decode())
+            if msg.get("type") == "ELECTION_BID":
+                election_bids[msg["worker_id"]] = {"space": msg["free_space"], "ip": msg["ip"]}
+            elif msg.get("type") == "ELECTION_VICTORY":
+                print(f"[REDE] Novo Master reconhecido no IP: {msg['ip']}")
+                current_master_ip = msg["ip"]
+                heartbeat_fails = 0
+                if connect_to_master(current_master_ip, current_master_port):
+                    print("[WORKER] Conexão com novo master estabelecida!")
+        except Exception:
+            pass
 
-            # Aguarda resposta com timeout
-            sock.settimeout(HEARTBEAT_INTERVAL)
-            response_raw = receive_message(sock)
-            sock.settimeout(None)
 
-            if response_raw:
-                data = decode_message(response_raw)
-                if data.get("RESPONSE") == "ALIVE":
-                    print("[WORKER] MASTER respondeu ALIVE")
-                    with lock:
-                        heartbeat_fail_count = 0   # zera contador em caso de sucesso
-            else:
-                raise ConnectionError("Sem resposta do master")
-
-        except Exception as e:
-            with lock:
-                heartbeat_fail_count += 1
-                fails = heartbeat_fail_count
-
-            print(f"[WORKER] Falha no heartbeat ({fails}/{HEARTBEAT_FAIL_THRESHOLD}): {e}")
-
-            if fails >= HEARTBEAT_FAIL_THRESHOLD:
-                print("[WORKER] Master considerado offline. Iniciando eleição...")
-                _trigger_election()
-                return   # Esta thread encerra; uma nova será criada após eleição
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Escuta de mensagens do master
-# ─────────────────────────────────────────────────────────────────────────────
-
-def listen_master(sock):
-    global election_in_progress
-
+def send_heartbeat():
+    global heartbeat_fails, in_election, sock
     while True:
-        msg = receive_message(sock)
+        time.sleep(4)
+        
+        # Se estiver no meio de uma eleição, não fazemos nada
+        if in_election:
+            continue
+            
+        # Se o socket for None, consideramos que a conexão caiu (falha = True)
+        if sock is None:
+            success = False
+        else:
+            success = send_message(sock, heartbeat("MASTER"))
+        
+        if not success:
+            heartbeat_fails += 1
+            print(f"⚠️ [WORKER] Falha na conexão com Master ({heartbeat_fails}/{MAX_HEARTBEAT_FAILS})")
+            
+            if heartbeat_fails >= MAX_HEARTBEAT_FAILS:
+                print("🚨 [WORKER] Limite de falhas atingido. Master caiu!")
+                start_election()
+        else:
+            heartbeat_fails = 0
 
+
+def listen_master():
+    global sock, in_election
+    while True:
+        if in_election:
+            time.sleep(1)
+            continue
+            
+        if sock is None:
+            time.sleep(1)
+            continue
+            
+        msg = receive_message(sock)
+        
         if not msg:
-            print("[WORKER] Conexão perdida com master")
-            break
+            # A conexão caiu! Anulamos o socket, mas agora o Heartbeat vai perceber e contar as falhas
+            if sock is not None:
+                print("[WORKER] Conexão TCP perdida. O Heartbeat irá confirmar a queda...")
+                sock = None
+            time.sleep(2)
+            continue
 
         data = decode_message(msg)
 
-        # Tarefa recebida
         if data.get("type") == "task":
             process_task()
 
-        # Confirmação de heartbeat (caso venha pelo canal de escuta e não pelo send_heartbeat)
         elif data.get("TASK") == "HEARTBEAT" and data.get("RESPONSE") == "ALIVE":
             print("[WORKER] MASTER respondeu ALIVE")
 
-        # Redirecionamento para outro master (protocolo original do projeto)
-        elif data.get("type") == "command_redirect":
-            new_ip   = data["target_master_ip"]
-            new_port = data["target_master_port"]
-            print(f"[WORKER] Redirecionado para {new_ip}:{new_port}")
-            _reconnect_to_master(new_ip, new_port)
-            return
-
-        # Novo master anunciado (pode vir de outro worker eleito)
-        elif data.get("type") == "i_am_master":
-            new_ip   = data["master_ip"]
-            new_port = data["master_port"]
-            print(f"[WORKER] Novo master anunciado: {new_ip}:{new_port}")
-            _reconnect_to_master(new_ip, new_port)
-            return
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Eleição
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _trigger_election():
-    global election_in_progress
-
-    with lock:
-        if election_in_progress:
-            return
-        election_in_progress = True
-
-    start_election(
-        worker_id=worker_id,
-        my_ip=MY_IP,
-        peer_ips=PEER_IPS,
-        on_elected_as_master=_become_master,
-        on_new_master_found=_reconnect_to_master
-    )
-
-
-def _become_master():
-    """
-    Este worker foi eleito master.
-    Importa e inicia o servidor master neste mesmo processo.
-    """
-    global election_in_progress
-
-    print(LOG_SEPARATOR)
-    print("[ELECTION] Tornando-se MASTER...")
-    print(LOG_SEPARATOR)
-
-    with lock:
-        election_in_progress = False
-
-    # Importa o módulo master e sobe o servidor.
-    # O master.py foi escrito para rodar de forma bloqueante (start_server),
-    # por isso o executamos em uma thread separada.
-    import master
-    threading.Thread(target=master.start_server, args=(MASTER_PORT,), daemon=False).start()
-
-    # Reinicia as threads de monitoramento do master
-    threading.Thread(target=master.monitor_load, daemon=True).start()
-    threading.Thread(target=master.simulate_requests, daemon=True).start()
-
-    print("[ELECTION] Servidor master iniciado neste worker.")
-
-
-def _reconnect_to_master(new_ip, new_port):
-    global master_ip, master_port, heartbeat_fail_count, election_in_progress, current_sock
-
-    print(LOG_SEPARATOR)
-    print(f"[WORKER] Reconectando ao novo master {new_ip}:{new_port}")
-    print(LOG_SEPARATOR)
-
-    master_ip   = new_ip
-    master_port = new_port
-
-    with lock:
-        heartbeat_fail_count = 0
-        election_in_progress = False
-
-    # Tenta reconectar com retries
-    for attempt in range(1, 6):
-        try:
-            sock = connect_to_master(new_ip, new_port)
-            current_sock = sock
-            # Reinicia threads
-            threading.Thread(target=send_heartbeat, args=(sock,), daemon=True).start()
-            threading.Thread(target=listen_master,  args=(sock,), daemon=False).start()
-            return
-        except Exception as e:
-            print(f"[WORKER] Tentativa {attempt}/5 falhou: {e}")
-            time.sleep(3)
-
-    print("[WORKER] Não foi possível reconectar. Encerrando.")
-    sys.exit(1)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Entrada principal
-# ─────────────────────────────────────────────────────────────────────────────
-
+# --- INICIALIZAÇÃO ---
 print(LOG_SEPARATOR)
 print("WORKER INICIADO:", worker_id)
-print("IP local:      ", MY_IP)
-print("Master inicial:", master_ip, ":", master_port)
-print("Peers:         ", PEER_IPS)
 print(LOG_SEPARATOR)
 
-current_sock = connect_to_master(master_ip, master_port)
+threading.Thread(target=listen_election_messages, daemon=True).start()
+threading.Thread(target=send_heartbeat, daemon=True).start()
+threading.Thread(target=listen_master, daemon=True).start()
 
-threading.Thread(target=send_heartbeat, args=(current_sock,), daemon=True).start()
-listen_master(current_sock)
+if not connect_to_master(current_master_ip, current_master_port):
+    print("[WORKER] Master não encontrado na inicialização. Iniciando eleição...")
+    start_election()
+
+# --- LOOP PRINCIPAL SALVA-VIDAS ---
+try:
+    while True:
+        time.sleep(1)
+except KeyboardInterrupt:
+    print("\n" + LOG_SEPARATOR)
+    print("[WORKER] Encerrando pelo usuário (Ctrl+C)...")
+    print(LOG_SEPARATOR)

@@ -71,7 +71,7 @@ def _listen_for_announces(my_id, my_ip, collect_time):
             conn.settimeout(2)
             raw = b""
             while True:
-                chunk = conn.recv(1024)
+                chunk = conn.recv(4096)
                 if not chunk:
                     break
                 raw += chunk
