@@ -88,15 +88,6 @@ def simulate_requests():
         time.sleep(REQUEST_INTERVAL)
 
 
-def create_connections(server):
-    while True:
-        conn, addr = server.accept()
-        print("[MASTER] Nova conexão:", addr)
-        threading.Thread(target=handle_worker, args=(conn,), daemon=True).start()
-
-
-# Dentro do master.py...
-
 def start_server(port):
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

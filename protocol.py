@@ -86,3 +86,24 @@ def i_am_master(master_id, master_ip, master_port):
         "master_ip": master_ip,
         "master_port": master_port
     }
+
+
+def election_bid(worker_id, free_space, ip, port):
+    """Broadcast UDP: candidatura na eleição legada (worker.py)."""
+    return {
+        "type": "ELECTION_BID",
+        "worker_id": worker_id,
+        "free_space": free_space,
+        "ip": ip,
+        "port": port,
+    }
+
+
+def election_victory(worker_id, ip, port):
+    """Broadcast UDP: anúncio do vencedor da eleição legada."""
+    return {
+        "type": "ELECTION_VICTORY",
+        "worker_id": worker_id,
+        "ip": ip,
+        "port": port,
+    }
